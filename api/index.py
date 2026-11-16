@@ -66,44 +66,6 @@ class User(Base):
 # Uses Argon2id with OWASP-recommended defaults and automatic salting
 ph = PasswordHasher()
 
-
-# def get_db_connection():
-#     if not DATABASE_URL:
-#         raise RuntimeError("DATABASE_URL environment variable is not set.")
-#     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-
-
-# def init_db():
-#     conn = get_db_connection()
-#     try:
-#         with conn.cursor() as cur:
-#             cur.execute(
-#                 """
-#                 CREATE TABLE IF NOT EXISTS users (
-#                     id SERIAL PRIMARY KEY,
-#                     first_name VARCHAR(100) NOT NULL,
-#                     last_name VARCHAR(100) NOT NULL,
-#                     email VARCHAR(255) UNIQUE NOT NULL,
-#                     password_hash TEXT NOT NULL,
-#                     accepted_terms BOOLEAN NOT NULL DEFAULT TRUE,
-#                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-#                 );
-#                 """
-#             )
-#         conn.commit()
-#     finally:
-#         conn.close()
-
-
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     if DATABASE_URL:
-#         init_db()
-#     yield
-
-
-#app = FastAPI(title="Signup CRUD API (Argon2)", lifespan=lifespan)
-
 app = FastAPI(title="Signup CRUD API (Argon2)")
 
 app.add_middleware(
