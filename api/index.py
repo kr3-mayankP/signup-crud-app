@@ -1,58 +1,110 @@
 import os
-from contextlib import asynccontextmanager
 from argon2.exceptions import VerificationError
 from argon2 import PasswordHasher
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
+from datetime import datetime
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    func,
+    select,
+    text,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from sqlalchemy.exc import IntegrityError
+from collections.abc import Generator
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+#----------------------------------------------------
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set.")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    first_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    accepted_terms: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, server_default=func.now()
+    )
+
+#----------------------------------------------------
+
 # Uses Argon2id with OWASP-recommended defaults and automatic salting
 ph = PasswordHasher()
 
 
-def get_db_connection():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL environment variable is not set.")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+# def get_db_connection():
+#     if not DATABASE_URL:
+#         raise RuntimeError("DATABASE_URL environment variable is not set.")
+#     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
-def init_db():
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    first_name VARCHAR(100) NOT NULL,
-                    last_name VARCHAR(100) NOT NULL,
-                    email VARCHAR(255) UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    accepted_terms BOOLEAN NOT NULL DEFAULT TRUE,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-        conn.commit()
-    finally:
-        conn.close()
+# def init_db():
+#     conn = get_db_connection()
+#     try:
+#         with conn.cursor() as cur:
+#             cur.execute(
+#                 """
+#                 CREATE TABLE IF NOT EXISTS users (
+#                     id SERIAL PRIMARY KEY,
+#                     first_name VARCHAR(100) NOT NULL,
+#                     last_name VARCHAR(100) NOT NULL,
+#                     email VARCHAR(255) UNIQUE NOT NULL,
+#                     password_hash TEXT NOT NULL,
+#                     accepted_terms BOOLEAN NOT NULL DEFAULT TRUE,
+#                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+#                 );
+#                 """
+#             )
+#         conn.commit()
+#     finally:
+#         conn.close()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    if DATABASE_URL:
-        init_db()
-    yield
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     if DATABASE_URL:
+#         init_db()
+#     yield
 
 
-app = FastAPI(title="Signup CRUD API (Argon2)", lifespan=lifespan)
+#app = FastAPI(title="Signup CRUD API (Argon2)", lifespan=lifespan)
+
+app = FastAPI(title="Signup CRUD API (Argon2)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -99,7 +151,7 @@ def health_check():
 
 
 @app.post("/api/signup", status_code=status.HTTP_201_CREATED)
-def signup(payload: SignupRequest):
+def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     if not payload.accepted_terms:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -112,105 +164,96 @@ def signup(payload: SignupRequest):
             detail="Passwords do not match.",
         )
 
-    # Ensures table exists even on serverless cold starts
-    init_db()
-
-    # Hash password using Argon2id (returns encoded string with algorithm, params, salt, and hash)
     hashed_pw = ph.hash(payload.password)
 
-    conn = get_db_connection()
+    new_user = User(
+        first_name=payload.first_name,
+        last_name=payload.last_name,
+        email=str(payload.email).lower(),
+        password_hash=hashed_pw,
+        accepted_terms=payload.accepted_terms,
+    )
+
+    db.add(new_user)
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO users (first_name, last_name, email, password_hash, accepted_terms)
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING id, first_name, last_name, email, created_at;
-                """,
-                (
-                    payload.first_name,
-                    payload.last_name,
-                    payload.email.lower(),
-                    hashed_pw,
-                    payload.accepted_terms,
-                ),
-            )
-            new_user = cur.fetchone()
-        conn.commit()
-        return {
-            "message": "Account created successfully!",
-            "user": new_user,
-        }
-    except psycopg2.errors.UniqueViolation:
-        conn.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An account with this email already exists.",
-        )
-    finally:
-        conn.close()
+        db.commit()
+        db.refresh(new_user)
+    except IntegrityError as error:
+        db.rollback()
+        if getattr(error.orig, "pgcode", None) == "23505":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account with this email already exists.",
+            ) from error
+        raise
+
+    return {
+        "message": "Account created successfully!",
+        "user": {
+            "id": new_user.id,
+            "first_name": new_user.first_name,
+            "last_name": new_user.last_name,
+            "email": new_user.email,
+            "created_at": new_user.created_at,
+        },
+    }
+
 #------------------------------------------------------------------------
 
 @app.post("/api/login")
-def login(payload: LoginRequest):
-    init_db()
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    email = str(payload.email).lower()
+    user = db.scalar(select(User).where(User.email == email))
 
-    conn = get_db_connection()
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+        )
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, first_name, last_name, email, password_hash
-                FROM users
-                WHERE email = %s;
-                """,
-                (str(payload.email).lower(),),
-            )
-            user = cur.fetchone()
+        ph.verify(user.password_hash, payload.password)
+    except VerificationError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+        )
 
-        if user is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password.",
-            )
-
-        try:
-            ph.verify(user["password_hash"], payload.password)
-        except VerificationError:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password.",
-            )
-
-        return {
-            "message": "Login successful.",
-            "user": {
-                "id": user["id"],
-                "first_name": user["first_name"],
-                "last_name": user["last_name"],
-                "email": user["email"],
-            },
-        }
-    finally:
-        conn.close()
+    return {
+        "message": "Login successful.",
+        "user": {
+            "id": user.id,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "email": user.email,
+        },
+    }
 
 #------------------------------------------------------------------------------
 
 
 @app.get("/api/users")
-def list_users():
-    init_db()
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, first_name, last_name, email, created_at
-                FROM users
-                ORDER BY created_at DESC;
-                """
-            )
-            users = cur.fetchall()
-        return {"users": users}
-    finally:
-        conn.close()
+def list_users(db: Session = Depends(get_db)):
+    users = db.execute(
+        select(
+            User.id,
+            User.first_name,
+            User.last_name,
+            User.email,
+            User.created_at,
+        ).order_by(User.created_at.desc())
+    ).all()
+
+    return {
+        "users": [
+            {
+                "id": user.id,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "email": user.email,
+                "created_at": user.created_at,
+            }
+            for user in users
+        ]
+    }

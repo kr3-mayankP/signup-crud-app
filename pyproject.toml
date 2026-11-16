@@ -9,4 +9,5 @@ dependencies = [
   "argon2-cffi==23.1.0",
   "pydantic[email]==2.14.3",
   "python-dotenv==1.0.1",
+  "sqlalchemy>=2.0.36"
 ]
